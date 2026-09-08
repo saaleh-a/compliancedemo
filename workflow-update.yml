@@ -1,21 +1,18 @@
+# This is a synchronized template of .github/workflows/deploy-container-app.yml.
+# Keep it aligned with the authoritative direct OIDC deployment workflow.
 # ============================================================
-# GitHub Actions — Build & Push to ACR
-# CI/CD pipeline for compliant deployments to Azure Container App.
+# GitHub Actions — Build, push, and deploy to Azure Container Apps
 #
-# How it works:
-# 1. Builds Docker image with immutable compliance labels
-# 2. Pushes to ACR using admin credentials (no Azure AD auth needed)
-# 3. ACR emits Event Grid "ImagePushed" event
-# 4. Event Grid → Automation Runbook → az containerapp update
-#    (runs inside Azure with managed identity — bypasses CAP)
+# The workflow uses GitHub OIDC (not ACR admin credentials) and updates the
+# provisioned Container App directly. This ensures the write is traceable to
+# the CI identity and the image labels are immutable pipeline evidence.
 #
-# Compliance signals (tamper-proof):
-#   - Docker image labels: commit-sha, pipeline-run-id, branch, repo
-#     (immutable once pushed to ACR)
-#   - Activity Log caller: Automation MI (Azure AD enforced)
+# Required GitHub Actions variables:
+#   ACR_NAME, RESOURCE_GROUP_NAME, CONTAINER_APP_NAME
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
 #
-# Required secrets:
-#   ACR_USERNAME / ACR_PASSWORD  — ACR admin credentials
+# The federated Azure identity needs AcrPush on the registry plus Container Apps
+# Contributor and Tag Contributor on the target Container App.
 # ============================================================
 name: Deploy Container App
 
@@ -29,30 +26,49 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 env:
-  ACR_NAME: acrcompliancedemoenqgb2
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  RESOURCE_GROUP_NAME: ${{ vars.RESOURCE_GROUP_NAME }}
+  CONTAINER_APP_NAME: ${{ vars.CONTAINER_APP_NAME }}
   IMAGE_NAME: compliance-demo-api
 
 jobs:
-  build-and-push:
+  build-push-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Log in to ACR
+      - name: Validate deployment configuration
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
         run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | \
-            docker login "${{ env.ACR_NAME }}.azurecr.io" \
-              -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+          for name in ACR_NAME RESOURCE_GROUP_NAME CONTAINER_APP_NAME AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+            if [ -z "${!name}" ]; then
+              echo "GitHub Actions variable $name is required." >&2
+              exit 1
+            fi
+          done
+
+      - name: Login to Azure using OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        run: az acr login --name "$ACR_NAME"
 
       - name: Build and push image
         run: |
-          SHA_TAG="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-          LATEST_TAG="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest"
+          SHA_TAG="${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${{ github.sha }}"
+          LATEST_TAG="${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest"
 
-          # Immutable compliance labels — baked into the image, can't be tampered
           docker build \
             --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
             --label "org.opencontainers.image.revision=${{ github.sha }}" \
@@ -66,18 +82,50 @@ jobs:
             -t "$LATEST_TAG" \
             src/api/
 
-          # Push SHA-tagged image first (triggers Event Grid → deploy)
           docker push "$SHA_TAG"
-          # Push :latest as well (fallback reference)
           docker push "$LATEST_TAG"
-          echo "✅ Pushed: $SHA_TAG"
-          echo "🔄 Event Grid will trigger deployment automatically"
+          echo "Pushed: $SHA_TAG"
+
+      - name: Deploy immutable image to Container App
+        id: deploy
+        run: |
+          SHA_TAG="${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${{ github.sha }}"
+          az containerapp update \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP_NAME" \
+            --image "$SHA_TAG" \
+            --output none
+
+          APP_ID=$(az containerapp show \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP_NAME" \
+            --query id -o tsv)
+          az tag update \
+            --resource-id "$APP_ID" \
+            --operation Merge \
+            --tags \
+              deployed-by=pipeline \
+              pipeline-run-id="${{ github.run_id }}" \
+              commit-sha="${{ github.sha }}" \
+              branch="${{ github.ref_name }}" \
+              repository="${{ github.repository }}" \
+              workflow="${{ github.workflow }}" \
+            --output none
+
+          FQDN=$(az containerapp show \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP_NAME" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
+
+      - name: Verify deployment health
+        run: curl --fail --show-error --retry 6 --retry-delay 5 "https://${{ steps.deploy.outputs.fqdn }}/health"
 
       - name: Summary
         run: |
-          echo "### ✅ Image Pushed to ACR" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Deploy**: Automatic via Event Grid → Automation Runbook" >> $GITHUB_STEP_SUMMARY
-          echo "- **App URL**: https://ca-api-compliancedemo.ashypond-ed21e6b9.eastus2.azurecontainerapps.io" >> $GITHUB_STEP_SUMMARY
+          echo "### Container App deployment completed" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image**: \`${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commit**: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch**: ${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Deployment**: Direct OIDC-authenticated Container App update" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **App URL**: https://${{ steps.deploy.outputs.fqdn }}" >> "$GITHUB_STEP_SUMMARY"

@@ -66,6 +66,14 @@ echo -e "${GREEN}  LAW Name: $LAW_NAME${NC}"
 echo -e "${GREEN}  LAW ID: $LAW_ID${NC}"
 echo -e "${GREEN}  LAW Workspace ID: $LAW_WORKSPACE_ID${NC}"
 
+APPROVED_PIPELINE_CALLER_IDS="${APPROVED_PIPELINE_CALLER_IDS:-NOT_CONFIGURED}"
+if [[ "$APPROVED_PIPELINE_CALLER_IDS" == "NOT_CONFIGURED" ]]; then
+  echo -e "${YELLOW}  No verified Container App writer application IDs configured; scheduled scans will fail closed as INVESTIGATE.${NC}"
+else
+  echo -e "${GREEN}  Approved Container App writer application IDs: $APPROVED_PIPELINE_CALLER_IDS${NC}"
+fi
+export APPROVED_PIPELINE_CALLER_IDS
+
 # ---- Helper: Get auth token for SRE Agent API ----
 get_agent_token() {
   az account get-access-token --resource "https://azuresre.dev" --query accessToken -o tsv 2>/dev/null
@@ -131,7 +139,7 @@ echo -e "\n${YELLOW}[2/7] Configuring Activity Log diagnostic settings...${NC}"
 
 SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
-# Check existing diagnostic settings — recreate if pointing to wrong workspace
+# Check existing diagnostic settings and update in place if the workspace differs.
 EXISTING=$(az monitor diagnostic-settings subscription list \
   --query "[?name=='activity-to-law'].name" -o tsv 2>/dev/null || echo "")
 EXISTING_WS=$(az monitor diagnostic-settings subscription list \
@@ -141,8 +149,7 @@ if [[ -n "$EXISTING" && "$EXISTING_WS" == *"$LAW_NAME"* ]]; then
   echo -e "${GREEN}  Diagnostic setting 'activity-to-law' already exists (correct workspace). Skipping.${NC}"
 else
   if [[ -n "$EXISTING" ]]; then
-    echo "  Existing diagnostic setting points to wrong workspace. Deleting..."
-    az monitor diagnostic-settings subscription delete --name "activity-to-law" --yes 2>/dev/null || true
+    echo "  Updating existing diagnostic setting to the configured workspace..."
   fi
   if az monitor diagnostic-settings subscription create \
     --name "activity-to-law" \
@@ -151,7 +158,8 @@ else
     --output none; then
     echo -e "${GREEN}  ✓ Diagnostic settings configured → ${LAW_NAME}${NC}"
   else
-    echo -e "${YELLOW}  Could not create diagnostic settings (may need elevated permissions or already exists).${NC}"
+    echo -e "${RED}ERROR: Could not configure Activity Log routing. Aborting to avoid an unmonitored compliance scan.${NC}"
+    exit 1
   fi
 fi
 
@@ -210,8 +218,8 @@ else
 fi
 sleep 5
 
-# ---- Step 5: Create Compliance Skill ----
-echo -e "\n${YELLOW}[5/7] Creating deployment-compliance-check skill...${NC}"
+# ---- Step 5: Create Compliance Skills ----
+echo -e "\n${YELLOW}[5/7] Creating compliance skills...${NC}"
 
 SKILL_CONTENT=$(cat "$DEMO_DIR/skills/deployment-compliance-check/SKILL.md" 2>/dev/null || echo "")
 DETECTION_CONTENT=$(cat "$DEMO_DIR/skills/deployment-compliance-check/compliance_detection.md" 2>/dev/null || echo "")
@@ -237,12 +245,46 @@ print(json.dumps(body))
 ")
   RESULT=$(agent_api PUT "/api/v2/extendedAgent/skills/deployment-compliance-check" "$SKILL_BODY"  || echo "FAILED")
   if echo "$RESULT" | grep -q "deployment-compliance-check" 2>/dev/null; then
-    echo -e "${GREEN}  ✓ Skill 'deployment-compliance-check' created.${NC}"
+    echo -e "${GREEN}  ✓ Interactive skill 'deployment-compliance-check' created.${NC}"
   else
-    echo -e "${YELLOW}  Skill may need manual setup. Response: ${RESULT:0:200}${NC}"
+    echo -e "${YELLOW}  Interactive skill may need manual setup. Response: ${RESULT:0:200}${NC}"
   fi
 else
-  echo -e "${RED}  Skill files not found at $DEMO_DIR/skills/${NC}"
+  echo -e "${RED}  Interactive skill files not found at $DEMO_DIR/skills/${NC}"
+fi
+
+SCAN_SKILL_CREATED=false
+SCAN_SKILL_CONTENT=$(cat "$DEMO_DIR/skills/deployment-compliance-scan/SKILL.md" 2>/dev/null || echo "")
+if [[ -n "$SCAN_SKILL_CONTENT" ]]; then
+  SCAN_SKILL_BODY=$(python3 -c "
+import json, os
+skill = open('$DEMO_DIR/skills/deployment-compliance-scan/SKILL.md').read()
+allowed_callers = ','.join(item.strip() for item in os.environ.get('APPROVED_PIPELINE_CALLER_IDS', '').split(',') if item.strip()) or 'NOT_CONFIGURED'
+skill = skill.replace('{{APPROVED_PIPELINE_CALLER_IDS}}', allowed_callers)
+body = {
+    'name': 'deployment-compliance-scan',
+    'type': 'Skill',
+    'properties': {
+        'description': 'Read-only scheduled compliance scan for Azure Container Apps',
+        'tools': ['QueryLogAnalyticsByWorkspaceId', 'GetAzCliHelp', 'RunAzCliReadCommands'],
+        'skillContent': skill
+    }
+}
+print(json.dumps(body))
+")
+  RESULT=$(agent_api PUT "/api/v2/extendedAgent/skills/deployment-compliance-scan" "$SCAN_SKILL_BODY" || echo "FAILED")
+  if echo "$RESULT" | grep -q "deployment-compliance-scan" 2>/dev/null; then
+    SCAN_SKILL_CREATED=true
+    echo -e "${GREEN}  ✓ Read-only skill 'deployment-compliance-scan' created.${NC}"
+  else
+    echo -e "${RED}  Read-only skill creation failed. Response: ${RESULT:0:200}${NC}"
+  fi
+else
+  echo -e "${RED}  Read-only skill file not found at $DEMO_DIR/skills/deployment-compliance-scan/${NC}"
+fi
+if [[ "$SCAN_SKILL_CREATED" != "true" ]]; then
+  echo -e "${RED}ERROR: Not creating the scheduled task because the read-only scan skill is unavailable.${NC}"
+  exit 1
 fi
 
 # ---- Step 6: Create Approval Hook ----
@@ -300,9 +342,9 @@ body = {
     'maxAttempts': 3,
     'instructions': '''Use the deployment-compliance-check skill to investigate this alert.
 
-The skill has all the KQL templates, classification rules, and revert procedures.
-If the deployment is non-compliant, activate the deployment-compliance-approval hook before reverting.
-Never revert without user approval.'''
+The skill has the KQL templates and classification rules. Report non-compliance by default.
+Only propose a rollback after identifying a healthy, label-compliant replacement and a safe rollback target.
+Before any modification, activate the deployment-compliance-approval hook and wait for explicit user approval.'''
 }
 with open('/tmp/filter-body.json', 'w') as f:
     json.dump(body, f)
@@ -337,51 +379,89 @@ curl -s -o /dev/null -X DELETE \
   -H "Authorization: Bearer ${TOKEN}" 2>/dev/null || true
 
 # ---- Create scheduled task for periodic compliance scans ----
-echo "   Creating compliance scan scheduled task..."
+echo "   Updating compliance scan scheduled task..."
 TOKEN=$(get_agent_token)
+SCHEDULED_TASK_PROMPT='Load the deployment-compliance-scan skill and check whether the latest running image is compliant for all Container Apps in scope. This skill is read-only and scheduled scans are detection-only: do not modify Container Apps, revisions, traffic, workflows, images, or agent configuration. Report findings in the skill format, including whether a healthy label-compliant replacement and rollback target exist. If either is missing, report the blocked remediation and the CI/CD repair needed.'
+export SCHEDULED_TASK_PROMPT
 
-# Delete existing task if present
-EXISTING_TASKS=$(curl -s "${AGENT_ENDPOINT}/api/v1/scheduledtasks" \
-  -H "Authorization: Bearer ${TOKEN}" 2>/dev/null || echo "[]")
-echo "$EXISTING_TASKS" | python3 -c "
-import sys,json
+scheduled_task_is_current() {
+  curl -s "${AGENT_ENDPOINT}/api/v2/extendedAgent/scheduledtasks/compliance-scan" \
+    -H "Authorization: Bearer ${TOKEN}" 2>/dev/null | python3 -c "
+import os,sys,json
 try:
-    tasks=json.load(sys.stdin)
-    for t in tasks:
-        if t.get('name')=='compliance-scan':
-            print(t.get('id',''))
-except: pass
-" 2>/dev/null | while read -r task_id; do
-  if [ -n "$task_id" ]; then
-    curl -s -o /dev/null -X DELETE "${AGENT_ENDPOINT}/api/v1/scheduledtasks/${task_id}" \
-      -H "Authorization: Bearer ${TOKEN}" 2>/dev/null
-  fi
-done
+    d=json.load(sys.stdin)
+    props=d.get('properties', d)
+    valid = (
+        d.get('name')=='compliance-scan'
+        and props.get('description')=='compliance-scan'
+        and props.get('cronExpression')=='*/30 * * * *'
+        and props.get('agentPrompt') == os.environ['SCHEDULED_TASK_PROMPT']
+    )
+    print('ok' if valid else 'invalid')
+except: print('invalid')
+" 2>/dev/null
+}
 
-python3 -c "
-import json
+if [ "$(scheduled_task_is_current)" = "ok" ]; then
+  echo -e "${GREEN}  ✓ Scheduled task already uses the required read-only configuration.${NC}"
+else
+  # Do not leave an unverified legacy task active if the replacement cannot be created.
+  # A missing task returns 404, which is safe because the subsequent PUT creates it.
+  echo "   Removing stale or unverified compliance scan task before replacement..."
+  DELETE_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X DELETE "${AGENT_ENDPOINT}/api/v2/extendedAgent/scheduledtasks/compliance-scan" \
+    -H "Authorization: Bearer ${TOKEN}")
+  if [ "$DELETE_HTTP_CODE" != "200" ] && [ "$DELETE_HTTP_CODE" != "202" ] && [ "$DELETE_HTTP_CODE" != "204" ] && [ "$DELETE_HTTP_CODE" != "404" ]; then
+    echo -e "${RED}ERROR: Could not remove stale compliance-scan (HTTP ${DELETE_HTTP_CODE}); refusing to create a replacement beside an unverified task.${NC}"
+    exit 1
+  fi
+
+  python3 -c "
+import json, os
 body = {
     'name': 'compliance-scan',
-    'description': 'compliance-scan',
-    'cronExpression': '*/30 * * * *',
-    'agentPrompt': '''Load the deployment-compliance-check skill and follow it to check whether the latest running image is compliant for all Container Apps in scope. Use hooks before any modification action on a resource. Report findings in the format specified by the skill. Remediate following the skill instructions'''
+    'type': 'ScheduledTask',
+    'properties': {
+        'description': 'compliance-scan',
+        'cronExpression': '*/30 * * * *',
+        'agentPrompt': os.environ['SCHEDULED_TASK_PROMPT']
+    }
 }
 with open('/tmp/task-body.json', 'w') as f:
     json.dump(body, f)
 "
 
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-  -X POST "${AGENT_ENDPOINT}/api/v1/scheduledtasks" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -H "Content-Type: application/json" \
-  --data-binary @/tmp/task-body.json)
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X PUT "${AGENT_ENDPOINT}/api/v2/extendedAgent/scheduledtasks/compliance-scan" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data-binary @/tmp/task-body.json)
 
-if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ]; then
-  echo -e "${GREEN}  ✓ Scheduled task created: compliance-scan (every 30 min)${NC}"
-else
-  echo -e "${YELLOW}  Scheduled task returned HTTP ${HTTP_CODE}${NC}"
+  rm -f /tmp/task-body.json
+  if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "202" ] || [ "$HTTP_CODE" = "204" ]; then
+    TASK_SYNCED=false
+    for attempt in 1 2 3 4 5; do
+      if [ "$(scheduled_task_is_current)" = "ok" ]; then
+        TASK_SYNCED=true
+        break
+      fi
+      sleep 2
+    done
+
+    if [ "$TASK_SYNCED" = true ]; then
+      echo -e "${GREEN}  ✓ Scheduled task updated: compliance-scan (every 30 min)${NC}"
+    else
+      echo -e "${RED}ERROR: Required read-only configuration was not observed; removing the unverified replacement.${NC}"
+      curl -s -o /dev/null -X DELETE \
+        "${AGENT_ENDPOINT}/api/v2/extendedAgent/scheduledtasks/compliance-scan" \
+        -H "Authorization: Bearer ${TOKEN}" || true
+      exit 1
+    fi
+  else
+    echo -e "${RED}ERROR: Could not create read-only compliance-scan (HTTP ${HTTP_CODE}); no stale task was retained.${NC}"
+    exit 1
+  fi
 fi
-rm -f /tmp/task-body.json
 
 # ---- Step 8: GitHub connector + code repo ----
 echo -e "\n${YELLOW}[8/8] Configuring GitHub connector and code repository...${NC}"
@@ -563,6 +643,25 @@ else
   VERIFY_FAIL=$((VERIFY_FAIL + 1))
 fi
 
+# Read-only scheduled scan skill
+SCAN_SKILL_OK=$(curl -s "${AGENT_ENDPOINT}/api/v2/extendedAgent/skills/deployment-compliance-scan" \
+  -H "Authorization: Bearer ${TOKEN}" 2>/dev/null | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    tools=set(d.get('properties',{}).get('tools', d.get('tools',[])))
+    expected={'QueryLogAnalyticsByWorkspaceId','GetAzCliHelp','RunAzCliReadCommands'}
+    print('ok' if d.get('name')=='deployment-compliance-scan' and expected.issubset(tools) and 'RunAzCliWriteCommands' not in tools else 'invalid')
+except: print('invalid')
+" 2>/dev/null)
+if [ "$SCAN_SKILL_OK" = "ok" ]; then
+  echo -e "    ${GREEN}✓ Skill: deployment-compliance-scan (read-only)${NC}"
+  VERIFY_PASS=$((VERIFY_PASS + 1))
+else
+  echo -e "    ${RED}✗ Skill: deployment-compliance-scan missing or not read-only${NC}"
+  VERIFY_FAIL=$((VERIFY_FAIL + 1))
+fi
+
 # Hook
 HOOK_OK=$(curl -s "${AGENT_ENDPOINT}/api/v2/extendedAgent/hooks/deployment-compliance-approval" \
   -H "Authorization: Bearer ${TOKEN}" 2>/dev/null | python3 -c "
@@ -599,20 +698,12 @@ else
 fi
 
 # Scheduled task
-TASK_OK=$(curl -s "${AGENT_ENDPOINT}/api/v1/scheduledtasks" \
-  -H "Authorization: Bearer ${TOKEN}" 2>/dev/null | python3 -c "
-import sys,json
-try:
-    data=json.load(sys.stdin)
-    found = any(t.get('name')=='compliance-scan' for t in data)
-    print('ok' if found else 'missing')
-except: print('missing')
-" 2>/dev/null)
+TASK_OK=$(scheduled_task_is_current)
 if [ "$TASK_OK" = "ok" ]; then
-  echo -e "    ${GREEN}✓ Scheduled task: compliance-scan${NC}"
+  echo -e "    ${GREEN}✓ Scheduled task: compliance-scan (read-only skill)${NC}"
   VERIFY_PASS=$((VERIFY_PASS + 1))
 else
-  echo -e "    ${RED}✗ Scheduled task: compliance-scan not found${NC}"
+  echo -e "    ${RED}✗ Scheduled task: compliance-scan missing, stale, or not read-only${NC}"
   VERIFY_FAIL=$((VERIFY_FAIL + 1))
 fi
 
@@ -622,7 +713,8 @@ echo -e "  ${BLUE}────────────────────�
 if [ "$VERIFY_FAIL" -eq 0 ]; then
   echo -e "  ${GREEN}✓ All ${VERIFY_PASS}/${VERIFY_PASS} checks passed — agent is fully set up!${NC}"
 else
-  echo -e "  ${YELLOW}⚠ ${VERIFY_PASS} passed, ${VERIFY_FAIL} failed — check items above${NC}"
+  echo -e "  ${RED}✗ ${VERIFY_PASS} passed, ${VERIFY_FAIL} failed — setup is incomplete${NC}"
+  exit 1
 fi
 
 # ---- Summary ----
@@ -637,10 +729,10 @@ echo "    ✓ Log Analytics: Activity Logs flowing (built-in KQL access)"
 echo "    ✓ Alert Rule: Container App deployment detection"
 echo "    ✓ Azure Monitor: Incident platform"
 echo "    ✓ GitHub connector + compliancedemo repo"
-echo "    ✓ Skill: deployment-compliance-check"
+echo "    ✓ Skills: deployment-compliance-check (interactive) + deployment-compliance-scan (read-only)"
 echo "    ✓ Hook: deployment-compliance-approval"
 echo "    ✓ Response plan: containerapp-compliance"
-echo "    ✓ Scheduled task: compliance-scan (every 30 min)"
+echo "    ✓ Scheduled task: compliance-scan (every 30 min, read-only)"
 echo ""
 echo "  To test the compliance workflow:"
 echo "    1. Push a change through GitHub Actions (compliant)"
