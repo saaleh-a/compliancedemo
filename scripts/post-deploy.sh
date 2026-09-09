@@ -402,6 +402,12 @@ except: print('invalid')
 " 2>/dev/null
 }
 
+scheduled_task_http_status() {
+  curl -s -o /dev/null -w "%{http_code}" \
+    "${AGENT_ENDPOINT}/api/v2/extendedAgent/scheduledtasks/compliance-scan" \
+    -H "Authorization: Bearer ${TOKEN}"
+}
+
 if [ "$(scheduled_task_is_current)" = "ok" ]; then
   echo -e "${GREEN}  ✓ Scheduled task already uses the required read-only configuration.${NC}"
 else
@@ -414,6 +420,23 @@ else
   if [ "$DELETE_HTTP_CODE" != "200" ] && [ "$DELETE_HTTP_CODE" != "202" ] && [ "$DELETE_HTTP_CODE" != "204" ] && [ "$DELETE_HTTP_CODE" != "404" ]; then
     echo -e "${RED}ERROR: Could not remove stale compliance-scan (HTTP ${DELETE_HTTP_CODE}); refusing to create a replacement beside an unverified task.${NC}"
     exit 1
+  fi
+
+  if [ "$DELETE_HTTP_CODE" = "202" ]; then
+    echo "   Waiting for scheduled-task deletion to complete..."
+    TASK_DELETED=false
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+      if [ "$(scheduled_task_http_status)" = "404" ]; then
+        TASK_DELETED=true
+        break
+      fi
+      sleep 2
+    done
+
+    if [ "$TASK_DELETED" != "true" ]; then
+      echo -e "${RED}ERROR: Scheduled-task deletion did not complete; refusing to race the replacement PUT.${NC}"
+      exit 1
+    fi
   fi
 
   python3 -c "
