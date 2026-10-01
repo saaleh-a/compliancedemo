@@ -62,7 +62,21 @@ Step 4: Verify resource tags (secondary)
 Compliant pipelines stamp tags like deployed-by=pipeline, pipeline-run-id, commit-sha, repository. Missing deployed-by tag is additional non-compliance evidence — but tags alone are weak because the Automation Runbook stamps them on every deploy, including ones triggered by manual ACR pushes.
 
 Step 5: Generate compliance report
-Report should include scan timestamp, time range, total/compliant/non-compliant counts, image label check results, and details of any violations.
+Use this format:
+
+```
+Compliance scan
+- Scan timestamp (UTC): <timestamp>
+- Evidence window: <window>
+- Scope: <resource group or subscription>
+- Totals: <total> apps; <compliant> compliant; <non-compliant> non-compliant; <investigate> investigate
+
+| Container App | Classification | Running image / digest | Caller evidence | Labels and provenance | Tags / revision history | Remediation |
+| --- | --- | --- | --- | --- | --- | --- |
+| <name> | <classification> | <image> | <caller or unavailable> | <result> | <result> | <action or reason none was taken> |
+```
+
+For `NON-COMPLIANT BOOTSTRAP`, state that no known-good ACR image or prior revision exists. Scheduled-task reports must state `Remediation: not attempted (detection-only)`; do not imply a revert was performed or available.
 
 Revert Procedures
 IMPORTANT: Always get user approval before any revert action.
