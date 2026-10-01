@@ -6,7 +6,7 @@ For each Container App deployment event (Microsoft.App/containerApps/write):
 
 ### 1. Classify the caller
 
-Extract `claims.appid` from Activity Logs (in KQL: `parse_json(Claims)["appid"]`).
+Extract `claims.appid` after normalizing `Claims` to a string (in KQL: `extend ClaimsObj = parse_json(tostring(Claims)) | extend AppId = tostring(ClaimsObj["appid"])`).
 
 - appid `c44b4083-3bb0-49c1-b47d-974e53cbdf3c` → Azure Portal → **NON-COMPLIANT**
 - appid `04b07795-a710-4e84-bea4-c697bab44963` → Azure CLI → **NON-COMPLIANT**
