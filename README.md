@@ -19,9 +19,11 @@ When a Container App deployment is detected:
 ```
 GitHub Actions (push to main)
     ↓
-Build Docker image → Push to ACR
+Build labeled image → Push to ACR
     ↓
-az containerapp update (with compliance tags)
+Event Grid image-push event
+    ↓
+Automation Runbook managed identity → az containerapp update
     ↓
 Activity Log: containerApps/write
     ↓                          ↓
@@ -35,6 +37,9 @@ Compliant? ──yes──► Close alert
     ↓ no
 Activate approval hook → Wait for user → Revert revision
 ```
+
+> [!IMPORTANT]
+> `azd provision` creates only the bootstrap Container App and ACR. It does not provision the Event Grid subscription or Automation Runbook shown above. Before dispatching the workflow, implement that deployment path and set the workflow's `ACR_NAME` to the registry emitted by the current `azd` environment. The checked-in workflow otherwise pushes only to its hard-coded registry and cannot update the provisioned Container App.
 
 ## Deployed Resources
 
@@ -63,31 +68,30 @@ azd provision
 # 2. Configure SRE Agent (connectors, skill, hook, response plan, scheduled task)
 bash scripts/post-deploy.sh
 
-# 3. Create service principal for GitHub Actions (run in Azure Portal Cloud Shell)
-az ad sp create-for-rbac --name "compliancedemo-deploy" \
-  --role Contributor \
-  --scopes "/subscriptions/<SUB_ID>/resourceGroups/rg-compliancedemo" \
-  --json-auth
+# 3. Provision and validate the Event Grid → Automation Runbook deployment path.
+#    This is not created by the Bicep templates today.
 
-# 4. Add GitHub secrets (see below)
+# 4. Set .github/workflows/deploy-container-app.yml ACR_NAME to the ACR emitted by azd.
+#    Add the ACR credentials required by that workflow (see below).
 
-# 5. Authorize GitHub connector
+# 5. Authorize the GitHub connector
 #    Open the OAuth URL printed by post-deploy.sh in your browser
 ```
 
-### GitHub Secrets & Variables
+### GitHub Secrets
 
-| Type | Name | Value |
-|------|------|-------|
-| Secret | `ACR_USERNAME` | ACR admin username |
-| Secret | `ACR_PASSWORD` | ACR admin password |
-| Secret | `AZURE_CREDENTIALS` | JSON output from `az ad sp create-for-rbac --json-auth` |
-| Variable | `ACR_NAME` | ACR name (without `.azurecr.io`) |
+| Secret | Value |
+|------|-------|
+| `ACR_USERNAME` | Username for the ACR configured in the workflow |
+| `ACR_PASSWORD` | Password for the ACR configured in the workflow |
+
+The checked-in workflow does not use `AZURE_CREDENTIALS`. Do not create a Contributor service principal merely for this sample unless the workflow is deliberately changed to make direct Azure deployment calls.
 
 ## Testing Compliance
 
 ```bash
-# Compliant deployment — push a code change via PR/merge
+# After the Event Grid → Automation Runbook path is provisioned and validated:
+# push a code change via PR/merge to trigger a compliant deployment.
 echo "// test" >> src/api/server.js
 git add . && git commit -m "test deployment" && git push
 
