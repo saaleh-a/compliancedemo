@@ -4,14 +4,14 @@ Detects and responds to non-compliant Azure Container App deployments using SRE 
 
 ## What it does
 
-- **Compliant**: Deployments via this CI/CD pipeline (GitHub Actions) — tagged with `deployed-by=pipeline`, `commit-sha`, `pipeline-run-id`
-- **Non-compliant**: Deployments via Azure Portal or ad-hoc CLI — detected by `claims.appid` in Activity Log
+- **Compliant**: A deployment has an approved caller and verified trusted image provenance; labels such as `deployed-by=pipeline`, `commit-sha`, and `pipeline-run-id` are supporting evidence.
+- **Non-compliant**: Deployments via Azure Portal or ad-hoc CLI, images without required metadata, images outside the configured registry, or invalid provenance.
 
 When a Container App deployment is detected:
 1. **Alert fires** → Activity Log alert on `Microsoft.App/containerApps/write`
-2. **SRE Agent investigates** → Runs the `deployment-compliance-check` skill via KQL
-3. **Classifies** → Portal app ID `c44b4083...` = non-compliant; CI/CD service principal = compliant
-4. **For non-compliant** → Activates approval hook, recommends revert to previous revision
+2. **SRE Agent investigates** → Uses `deployment-compliance-check` for interactive investigation or `deployment-compliance-scan` for scheduled detection
+3. **Classifies** → Portal or CLI caller = non-compliant; service-principal caller requires image provenance verification
+4. **For non-compliant** → Scheduled scans report only; interactive investigations activate the approval hook before any revert
 5. **For compliant** → Confirms and closes the alert
 
 ## Architecture
@@ -27,9 +27,9 @@ Activity Log: containerApps/write
     ↓                          ↓
 Alert Rule fires          Scheduled Task (every 30 min)
     ↓                          ↓
-SRE Agent Response Plan   SRE Agent Compliance Scan
-    ↓
-deployment-compliance-check skill (KQL queries)
+SRE Agent Response Plan   deployment-compliance-scan (read-only)
+    ↓                          ↓
+deployment-compliance-check skill  Report violation; do not mutate resources
     ↓
 Compliant? ──yes──► Close alert
     ↓ no

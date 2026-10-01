@@ -210,10 +210,11 @@ else
 fi
 sleep 5
 
-# ---- Step 5: Create Compliance Skill ----
-echo -e "\n${YELLOW}[5/7] Creating deployment-compliance-check skill...${NC}"
+# ---- Step 5: Create Compliance Skills ----
+echo -e "\n${YELLOW}[5/7] Creating deployment-compliance skills...${NC}"
 
 SKILL_CONTENT=$(cat "$DEMO_DIR/skills/deployment-compliance-check/SKILL.md" 2>/dev/null || echo "")
+SCAN_SKILL_CONTENT=$(cat "$DEMO_DIR/skills/deployment-compliance-scan/SKILL.md" 2>/dev/null || echo "")
 DETECTION_CONTENT=$(cat "$DEMO_DIR/skills/deployment-compliance-check/compliance_detection.md" 2>/dev/null || echo "")
 
 if [[ -n "$SKILL_CONTENT" ]]; then
@@ -243,6 +244,35 @@ print(json.dumps(body))
   fi
 else
   echo -e "${RED}  Skill files not found at $DEMO_DIR/skills/${NC}"
+fi
+
+if [[ -n "$SCAN_SKILL_CONTENT" && -n "$DETECTION_CONTENT" ]]; then
+  SCAN_SKILL_BODY=$(python3 -c "
+import json
+skill = open('$DEMO_DIR/skills/deployment-compliance-scan/SKILL.md').read()
+detection = open('$DEMO_DIR/skills/deployment-compliance-check/compliance_detection.md').read()
+body = {
+    'name': 'deployment-compliance-scan',
+    'type': 'Skill',
+    'properties': {
+        'description': 'Read-only scheduled compliance scan for Container App deployments',
+        'tools': ['QueryLogAnalyticsByWorkspaceId', 'GetAzCliHelp', 'RunAzCliReadCommands'],
+        'skillContent': skill,
+        'additionalFiles': [
+            {'filePath': 'compliance_detection.md', 'content': detection}
+        ]
+    }
+}
+print(json.dumps(body))
+")
+  RESULT=$(agent_api PUT "/api/v2/extendedAgent/skills/deployment-compliance-scan" "$SCAN_SKILL_BODY" || echo "FAILED")
+  if echo "$RESULT" | grep -q "deployment-compliance-scan" 2>/dev/null; then
+    echo -e "${GREEN}  ✓ Skill 'deployment-compliance-scan' created (read-only).${NC}"
+  else
+    echo -e "${YELLOW}  Read-only scan skill may need manual setup. Response: ${RESULT:0:200}${NC}"
+  fi
+else
+  echo -e "${RED}  Read-only scan skill files not found at $DEMO_DIR/skills/${NC}"
 fi
 
 # ---- Step 6: Create Approval Hook ----
@@ -364,7 +394,7 @@ body = {
     'name': 'compliance-scan',
     'description': 'compliance-scan',
     'cronExpression': '*/30 * * * *',
-    'agentPrompt': '''Load the deployment-compliance-check skill and follow it to check whether the latest running image is compliant for all Container Apps in scope. Use hooks before any modification action on a resource. Report findings in the format specified by the skill. Remediate following the skill instructions'''
+    'agentPrompt': '''Load the deployment-compliance-scan skill and check whether the latest running image is compliant for all Container Apps in scope. This scheduled execution is detection-only: inspect Activity Logs, revision images, trusted image provenance, labels, and tags; report findings in the skill format; do not modify resources, alter revisions or traffic, rerun workflows, or remediate. If a violation is found, state the approved interactive remediation path and stop.'''
 }
 with open('/tmp/task-body.json', 'w') as f:
     json.dump(body, f)
@@ -560,6 +590,22 @@ if [ "$SKILL_OK" = "ok" ]; then
   VERIFY_PASS=$((VERIFY_PASS + 1))
 else
   echo -e "    ${RED}✗ Skill: deployment-compliance-check not found${NC}"
+  VERIFY_FAIL=$((VERIFY_FAIL + 1))
+fi
+
+SCAN_SKILL_OK=$(curl -s "${AGENT_ENDPOINT}/api/v2/extendedAgent/skills/deployment-compliance-scan" \
+  -H "Authorization: Bearer ${TOKEN}" 2>/dev/null | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print('ok' if d.get('name')=='deployment-compliance-scan' else 'missing')
+except: print('missing')
+" 2>/dev/null)
+if [ "$SCAN_SKILL_OK" = "ok" ]; then
+  echo -e "    ${GREEN}✓ Skill: deployment-compliance-scan (read-only)${NC}"
+  VERIFY_PASS=$((VERIFY_PASS + 1))
+else
+  echo -e "    ${RED}✗ Skill: deployment-compliance-scan not found${NC}"
   VERIFY_FAIL=$((VERIFY_FAIL + 1))
 fi
 
