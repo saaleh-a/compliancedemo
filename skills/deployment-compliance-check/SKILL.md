@@ -26,9 +26,13 @@ Data Sources
 Activity Logs in Log Analytics
 Activity Logs flow to the Log Analytics workspace via diagnostic settings. Use QueryLogAnalyticsByWorkspaceId to run KQL against the AzureActivity table.
 
-To discover the workspace ID if needed:
+To discover the workspace ID, resolve the subscription diagnostic setting first. This avoids selecting the Container Apps environment workspace when more than one workspace exists:
 
-az monitor log-analytics workspace show --resource-group rg-compliancedemo --workspace-name law-compliance-compliancedemo --query customerId -o tsv
+az monitor diagnostic-settings subscription list --subscription <subscription-id> --query "value[?name=='activity-to-law'].workspaceId" -o tsv
+az monitor log-analytics workspace show --ids <workspace-resource-id> --query customerId -o tsv
+
+Before filtering, run an unfiltered same-window AzureActivity count and latest timestamp query, then run the resource-group-scoped summary and detailed write query. An empty scoped result alone does not prove that ingestion is absent.
+
 Container App Resource Tags
 Use RunAzCliReadCommands to check tags on the Container App.
 
@@ -39,13 +43,13 @@ How to Detect Compliance
 See compliance_detection.md for the detailed decision tree and well-known app IDs.
 
 Step 1: Query Activity Logs
-Query the AzureActivity table for Container App write operations. Extract claims.appid and Caller to identify who made the deployment. See compliance_detection.md for the KQL template.
+Query the AzureActivity table for Container App write operations. Extract `claims.appid` with `parse_json(tostring(Claims))` and use Caller to identify who made the deployment. See compliance_detection.md for the KQL template. If Log Analytics has no matching event, use the direct Activity Log fallback with `az monitor activity-log list --offset 90d`; caller identity is unavailable if the event is outside the rolling retention window.
 
 Step 2: Classify each deployment by caller
 Well-known Azure Portal / CLI / PowerShell app IDs → NON-COMPLIANT
 Caller contains @ (user principal) → NON-COMPLIANT
 Known pipeline managed identity → proceed to Step 3
-Unknown service principal → INVESTIGATE
+Unknown service principal → proceed to Step 3 and classify as INVESTIGATE only if all required image labels are valid
 Caller identity ALWAYS takes precedence over tags.
 
 Step 3: Verify Docker image labels (the tamper-proof check)
@@ -64,8 +68,14 @@ Compliant pipelines stamp tags like deployed-by=pipeline, pipeline-run-id, commi
 Step 5: Generate compliance report
 Report should include scan timestamp, time range, total/compliant/non-compliant counts, image label check results, and details of any violations.
 
+Scheduled task execution
+Scheduled compliance tasks are detection-only. Do not invoke the approval hook or modify any Azure resource, even for a non-compliant result, because a scheduled execution cannot satisfy the explicit interactive approval requirement. Report whether a safe remediation target exists and route remediation through an interactive alert or request.
+
+Bootstrap-only safety guard
+Classify as `NON-COMPLIANT BOOTSTRAP` when the live app runs a public or placeholder image, its pipeline tags use bootstrap values such as `initial`, the configured ACR contains no application image, and there is no prior healthy revision. Report remediation as blocked; do not reactivate the only failed revision, rerun a stale workflow, or invoke the approval hook because no safe rollback target exists.
+
 Revert Procedures
-IMPORTANT: Always get user approval before any revert action.
+IMPORTANT: Always get user approval before any revert action. Invoke the approval hook immediately before a verified, targeted revert.
 
 Option A — Reactivate previous Container App revision: list revisions, activate the last known-good one, shift traffic, deactivate the non-compliant revision.
 
